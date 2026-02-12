@@ -2,21 +2,20 @@ package main
 
 import (
 	"math/rand/v2"
-	"strings"
+
+	pool "github.com/libp2p/go-buffer-pool"
 )
 
 // Excluded for clarity: I, l, 1, O, o, 0
 const humanCharset = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 func randomString(n int) string {
-	// More efficient than make() because String() avoids copying
-	// the buffer.
-	b := strings.Builder{}
-	b.Grow(n)
+	b := pool.Get(n)
+	defer pool.Put(b)
 
-	for range n {
-		b.WriteByte(humanCharset[rand.IntN(len(humanCharset))])
+	for i := range b {
+		b[i] = humanCharset[rand.IntN(len(humanCharset))]
 	}
 
-	return b.String()
+	return string(b)
 }

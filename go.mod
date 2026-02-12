@@ -17,6 +17,7 @@ require (
 
 require (
 	github.com/klauspost/compress v1.17.6 // indirect
+	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
