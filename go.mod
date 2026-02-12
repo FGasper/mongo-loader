@@ -1,6 +1,6 @@
 module github.com/FGasper/mongo-loader
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/goaux/timer v1.1.0
