@@ -318,6 +318,7 @@ func doWork(ctx context.Context) error {
 					slog.Debug("Deleting random documents.",
 						"collection", collName,
 						"count", toDelete,
+						"fraction", fraction,
 					)
 
 					delRes, err := coll.DeleteMany(ctx, bson.D{{"$sampleRate", fraction}})
