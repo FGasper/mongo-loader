@@ -1,4 +1,4 @@
-module github.com/FGasper/mongo-loader
+module github.com/FGasper/mongo-writer
 
 go 1.24.0
 
