@@ -35,6 +35,8 @@ var (
 	canUpdate        bool
 	db               *mongo.Database
 	allOldDocsCounts = make(map[string]int64)
+
+	logLevel = slog.LevelInfo
 )
 
 func main() {
@@ -68,6 +70,10 @@ func main() {
 				Value:   docSizes,
 				Usage:   "Document sizes (in bytes) to generate",
 			},
+			&cli.BoolFlag{
+				Name:  "debug",
+				Usage: "Enable debug level logging",
+			},
 		},
 
 		// ACTION: This is where your actual main() logic goes
@@ -80,6 +86,10 @@ func main() {
 			// 2. Validate or Parse Complex Flags
 			// (e.g., converting string slice to int slice)
 			docSizes = cmd.IntSlice("sizes")
+
+			if cmd.Bool("debug") {
+				logLevel = slog.LevelDebug
+			}
 
 			// 3. Run your application logic
 			// return runLoadTest(ctx, uri, workers, docCount)
@@ -140,6 +150,7 @@ func run(ctx context.Context) error {
 						}
 						return a
 					},
+					Level: logLevel,
 				},
 			),
 		),
