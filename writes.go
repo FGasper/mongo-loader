@@ -67,7 +67,7 @@ func main() {
 			&cli.IntSliceFlag{
 				Name:    "docSizes",
 				Aliases: []string{"s"},
-				Value:   docSizes,
+				Value:   slices.Clone(docSizes),
 				Usage:   "Document sizes (in bytes) to generate",
 			},
 			&cli.BoolFlag{
@@ -81,11 +81,11 @@ func main() {
 			// 1. Retrieve Flag Values
 			uri = cmd.String("uri")
 			startWorkers = cmd.Int("workers")
-			newDocsCount = cmd.Int("docs")
+			newDocsCount = cmd.Int("docsPerBatch")
 
 			// 2. Validate or Parse Complex Flags
 			// (e.g., converting string slice to int slice)
-			docSizes = cmd.IntSlice("sizes")
+			docSizes = cmd.IntSlice("docSizes")
 
 			if cmd.Bool("debug") {
 				logLevel = slog.LevelDebug
@@ -214,11 +214,6 @@ func run(ctx context.Context) error {
 		return true
 	}
 
-	// A clean way to print in raw mode (since \n doesn't return carriage anymore)
-	printRaw := func(s any) {
-		fmt.Print(s, "\r\n")
-	}
-
 	printRaw("Press up to add a thread or down to remove one.")
 
 	// 2. The Input Loop
@@ -253,6 +248,15 @@ func run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// A clean way to print in raw mode (since \n doesn't return carriage anymore)
+func printRaw(s any) {
+	fmt.Print(s, "\r\n")
+}
+
+func printRawf(msg string, args ...any) (int, error) {
+	return fmt.Printf(msg+"\r\n", args...)
 }
 
 func doWork(ctx context.Context) error {
