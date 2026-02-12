@@ -6,23 +6,27 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"maps"
 	"math/rand"
 	"os"
 	"os/signal"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/MatusOllah/slogcolor"
+	"github.com/fatih/color"
 	"github.com/goaux/timer"
 	"github.com/mongodb-labs/migration-tools/bsontools"
+	"github.com/mongodb-labs/migration-tools/history"
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/samber/lo"
 	"github.com/urfave/cli/v3"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/term"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 var (
@@ -37,6 +41,10 @@ var (
 	allOldDocsCounts = make(map[string]int64)
 
 	logLevel = slog.LevelInfo
+
+	writesHistory = history.New[int](time.Minute)
+
+	localizer = message.NewPrinter(language.English)
 )
 
 func main() {
@@ -137,22 +145,34 @@ func run(ctx context.Context) error {
 	}
 	defer restoreTerm()
 
+	logOpts := *slogcolor.DefaultOptions
+	logOpts.SrcFileMode = slogcolor.Nop
+
+	// slogcolor’s defaults set the color in the background & leave a weird
+	// space afterward. This uses zerolog.ConsoleWriter’s scheme instead.
+	logOpts.LevelTags = map[slog.Level]string{
+		slog.LevelDebug: color.CyanString("DBG"),
+		slog.LevelInfo:  color.GreenString("INF"),
+		slog.LevelWarn:  color.YellowString("WRN"),
+		slog.LevelError: color.RedString("ERR"),
+	}
+
+	/*
+		logOpts.ReplaceAttr = func(groups []string, a slog.Attr) slog.Attr {
+			// If the key is "msg" and the value is empty, drop it.
+			if a.Key == slog.MessageKey && a.Value.String() == "" {
+				return slog.Attr{} // Return empty attr to discard
+			}
+			return a
+		}
+	*/
+
+	logOpts.Level = logLevel
+
 	crlfWriter := CRLFWriter{os.Stdout}
 	slog.SetDefault(
 		slog.New(
-			slog.NewTextHandler(
-				crlfWriter,
-				&slog.HandlerOptions{
-					ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-						// If the key is "msg" and the value is empty, drop it.
-						if a.Key == slog.MessageKey && a.Value.String() == "" {
-							return slog.Attr{} // Return empty attr to discard
-						}
-						return a
-					},
-					Level: logLevel,
-				},
-			),
+			slogcolor.NewHandler(crlfWriter, &logOpts),
 		),
 	)
 
@@ -166,28 +186,31 @@ func run(ctx context.Context) error {
 
 	//----------------------------------------------
 
-	workerCancel := map[int]context.CancelCauseFunc{}
+	workerCancel := xsync.NewMap[int, context.CancelCauseFunc]()
 
 	addWorker := func() {
-		workerNum := len(workerCancel)
+		workerNum := workerCancel.Size()
 
-		var workerCtx context.Context
-		workerCtx, workerCancel[workerNum] = context.WithCancelCause(ctx)
+		workerCtx, canceler := context.WithCancelCause(ctx)
+		workerCancel.Store(workerNum, canceler)
 
 		go func() {
 			defer func() {
-				workerCancel[workerNum](fmt.Errorf("worker %d ending", workerNum))
-				delete(workerCancel, workerNum)
+				canceler, ok := workerCancel.LoadAndDelete(workerNum)
+				lo.Assert(ok, "worker %d had no canceler?")
+
+				canceler(fmt.Errorf("worker %d ending", workerNum))
+
+				slog.Info("Worker ended.", "remaining", workerCancel.Size())
 			}()
 
 			for {
 				if err := doWork(workerCtx); err != nil {
 					if errors.Is(err, context.Canceled) {
-						slog.Info("Worker ended.", "remaining", len(workerCancel))
 						break
 					}
 
-					slog.Error("Worker failed; will retry.", "error", err, "remaining", len(workerCancel))
+					slog.Warn("Worker failed; will retry.", "error", err, "remaining", workerCancel.Size())
 
 					// No need to check the error since doWork will fail.
 					_ = timer.SleepCause(workerCtx, 2*time.Second)
@@ -196,25 +219,51 @@ func run(ctx context.Context) error {
 		}()
 	}
 
-	slog.Info("Starting workers.", "count", startWorkers)
+	go func() {
+		time.Sleep(5 * time.Second)
+
+		for {
+			logs := writesHistory.Get()
+			elapsed := time.Since(logs[0].At)
+
+			perSecond := float64(history.SumLogs(logs)) / elapsed.Seconds()
+
+			slog.Info("Periodic stats",
+				"writesPerSecond", localizer.Sprintf("%.02f", perSecond),
+			)
+
+			time.Sleep(10 * time.Second)
+		}
+	}()
+
+	printRaw(localizer.Sprintf("Starting %d workers.", startWorkers))
+	printRaw("Press up to add a worker or down to remove one.")
 
 	for range startWorkers {
 		addWorker()
 	}
 
 	popWorker := func() bool {
-		index, ok := lo.Last(slices.Sorted(maps.Keys(workerCancel)))
+		index := -1
 
+		workerCancel.RangeRelaxed(func(key int, value context.CancelCauseFunc) bool {
+			index = max(index, key)
+			return true
+		})
+
+		if index == -1 {
+			return false
+		}
+
+		canceler, ok := workerCancel.Load(index)
 		if !ok {
 			return false
 		}
 
-		workerCancel[index](fmt.Errorf("manual shutdown"))
+		canceler(fmt.Errorf("manual shutdown"))
 
 		return true
 	}
-
-	printRaw("Press up to add a thread or down to remove one.")
 
 	// 2. The Input Loop
 	// We read 3 bytes at a time to catch the full arrow key sequence
@@ -234,13 +283,13 @@ func run(ctx context.Context) error {
 		case '\x03': // CTRL-C
 			return nil
 		case '\x0d': // Enter
-			slog.Info("", "workers", len(workerCancel))
+			slog.Info("", "workers", workerCancel.Size())
 		case '\x1b':
 			if b[1] == '[' {
 				switch b[2] {
 				case 'A': // up arrow
 					addWorker()
-					slog.Info("Added worker", "newCount", len(workerCancel))
+					slog.Info("Added worker", "newCount", workerCancel.Size())
 
 				case 'B': // down arrow
 					popWorker()
@@ -275,7 +324,7 @@ func doWork(ctx context.Context) error {
 				// --- 1. INSERT ---
 				slog.Debug("Inserting documents.",
 					"collection", collName,
-					"count", newDocsCount,
+					"count", localizer.Sprintf("%d", newDocsCount),
 				)
 
 				var attrs []slog.Attr
@@ -284,6 +333,8 @@ func doWork(ctx context.Context) error {
 				if err != nil {
 					return fmt.Errorf("insert: %w", err)
 				}
+
+				writesHistory.Add(inserts)
 
 				attrs = append(attrs, slog.Int("inserts", inserts))
 
@@ -298,6 +349,8 @@ func doWork(ctx context.Context) error {
 					if err != nil {
 						return fmt.Errorf("update: %w", err)
 					}
+
+					writesHistory.Add(int(updates))
 
 					attrs = append(attrs, slog.Int("updates", int(updates)))
 				}
@@ -317,12 +370,13 @@ func doWork(ctx context.Context) error {
 
 					slog.Debug("Deleting random documents.",
 						"collection", collName,
-						"count", toDelete,
-						"fraction", fraction,
+						"count", localizer.Sprintf("%d", toDelete),
+						"fraction", localizer.Sprintf("%f", fraction),
 					)
 
 					delRes, err := coll.DeleteMany(ctx, bson.D{{"$sampleRate", fraction}})
 					if err == nil {
+						writesHistory.Add(int(delRes.DeletedCount))
 						totalDeleted += int(delRes.DeletedCount)
 					} else {
 						return fmt.Errorf("delete: %w", err)
@@ -331,12 +385,12 @@ func doWork(ctx context.Context) error {
 
 				attrs = append(
 					attrs,
-					slog.Int("deleted", totalDeleted),
+					slog.String("deleted", localizer.Sprintf("%d", totalDeleted)),
 					slog.Duration("elapsed", time.Since(startTime)),
 					slog.String("collection", collName),
 				)
 
-				slog.Info("Writes sent.", lo.ToAnySlice(attrs)...)
+				slog.Debug("Writes sent.", lo.ToAnySlice(attrs)...)
 			}
 		}
 	}
