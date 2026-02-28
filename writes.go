@@ -339,6 +339,11 @@ func doWork(ctx context.Context) error {
 					return fmt.Errorf("insert: %w", err)
 				}
 
+				slog.Debug("Inserted documents.",
+					"collection", collName,
+					"count", localizer.Sprintf("%d", inserts),
+				)
+
 				writesHistory.Add(inserts)
 
 				attrs = append(attrs, slog.Int("inserts", inserts))
@@ -354,6 +359,11 @@ func doWork(ctx context.Context) error {
 					if err != nil {
 						return fmt.Errorf("update: %w", err)
 					}
+
+					slog.Debug("Updated documents.",
+						"collection", collName,
+						"count", localizer.Sprintf("%d", updates),
+					)
 
 					writesHistory.Add(int(updates))
 
@@ -381,6 +391,11 @@ func doWork(ctx context.Context) error {
 
 					delRes, err := coll.DeleteMany(ctx, bson.D{{"$sampleRate", fraction}})
 					if err == nil {
+						slog.Debug("Deleted documents.",
+							"collection", collName,
+							"count", localizer.Sprintf("%d", delRes.DeletedCount),
+						)
+
 						writesHistory.Add(int(delRes.DeletedCount))
 						totalDeleted += int(delRes.DeletedCount)
 					} else {
