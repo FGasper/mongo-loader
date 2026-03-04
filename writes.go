@@ -310,10 +310,6 @@ func printRaw(s any) {
 	fmt.Print(s, "\r\n")
 }
 
-func printRawf(msg string, args ...any) (int, error) {
-	return fmt.Printf(msg+"\r\n", args...)
-}
-
 func doWork(ctx context.Context) error {
 	for {
 		for _, docSize := range docSizes {
@@ -530,6 +526,7 @@ func performInsert(ctx context.Context, coll *mongo.Collection, size int, useCus
 		doc := bson.M{
 			"rand":        rand.Float64(),
 			"str":         baseString + randomString(2*size/3),
+			"num":         rand.Float64(),
 			"fromUpdates": true,
 		}
 		if useCustomID {

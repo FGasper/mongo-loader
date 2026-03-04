@@ -96,6 +96,7 @@ while (true) {
                 _ => ({
                     _id: useCustomID ? Math.random() : null,
                     str: bigStr,
+                    num: Math.random(),
                     a: 1,
                 }),
             );
