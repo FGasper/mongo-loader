@@ -405,6 +405,9 @@ func doWork(ctx context.Context) error {
 						}
 					} else {
 						ids, err := getDocIDs(ctx, coll, toDelete)
+						if err != nil {
+							return fmt.Errorf("getting doc IDs for delete: %w", err)
+						}
 
 						delRes, err := coll.DeleteMany(ctx, bson.D{{"_id", bson.D{{"$in", ids}}}})
 						if err == nil {
@@ -511,8 +514,7 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 		}
 	*/
 
-	if VersionAtLeast(versionArray[:], 4, 4) {
-
+	if VersionAtLeast(versionArray[:], 4, 2) {
 		res := coll.Database().RunCommand(
 			ctx,
 			bson.D{
@@ -563,7 +565,7 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("merge aggregation: %w", err)
 	}
-	cursor.Close(ctx)
+	_ = cursor.Close(ctx)
 
 	return int32(len(ids)), nil
 }
