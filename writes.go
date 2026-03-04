@@ -24,6 +24,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"golang.org/x/exp/constraints"
 	"golang.org/x/term"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
@@ -36,7 +37,7 @@ var (
 	startWorkers  = 5
 	uri           = "mongodb://localhost:27017"
 
-	canUpdate        bool
+	versionArray     [3]int
 	db               *mongo.Database
 	allOldDocsCounts = make(map[string]int64)
 
@@ -119,7 +120,7 @@ func run(ctx context.Context) error {
 	defer client.Disconnect(ctx)
 
 	db = client.Database("test")
-	canUpdate, _ = checkUpdateCapability(ctx, client)
+	versionArray = lo.Must(GetVersionArray(ctx, client))
 
 	for _, docSize := range docSizes {
 		for _, useCustomID := range customIDModes {
@@ -351,26 +352,24 @@ func doWork(ctx context.Context) error {
 				attrs = append(attrs, slog.Int("inserts", inserts))
 
 				// --- 2. UPDATE ---
-				if canUpdate {
-					slog.Debug("Updating documents.",
-						"collection", collName,
-					)
+				slog.Debug("Updating documents.",
+					"collection", collName,
+				)
 
-					updates, err := performUpdate(ctx, coll)
+				updates, err := performUpdate(ctx, coll)
 
-					if err != nil {
-						return fmt.Errorf("update: %w", err)
-					}
-
-					slog.Debug("Updated documents.",
-						"collection", collName,
-						"count", localizer.Sprintf("%d", updates),
-					)
-
-					writesHistory.Add(int(updates))
-
-					attrs = append(attrs, slog.Int("updates", int(updates)))
+				if err != nil {
+					return fmt.Errorf("update: %w", err)
 				}
+
+				slog.Debug("Updated documents.",
+					"collection", collName,
+					"count", localizer.Sprintf("%d", updates),
+				)
+
+				writesHistory.Add(int(updates))
+
+				attrs = append(attrs, slog.Int("updates", int(updates)))
 
 				// --- 3. DELETE ---
 				totalDeleted := 0
@@ -405,29 +404,7 @@ func doWork(ctx context.Context) error {
 							return fmt.Errorf("delete: %w", err)
 						}
 					} else {
-						cursor, err := coll.Aggregate(
-							ctx,
-							mongo.Pipeline{
-								{{"$sample", bson.D{{"size", toDelete}}}},
-								{{"$project", bson.D{{"_id", 1}}}},
-							},
-						)
-						if err != nil {
-							return fmt.Errorf("get %d doc IDs: %w", toDelete, err)
-						}
-
-						var docs []bson.Raw
-						err = cursor.All(ctx, &docs)
-						if err != nil {
-							return fmt.Errorf("read %d doc IDs: %w", toDelete, err)
-						}
-
-						ids := lo.Map(
-							docs,
-							func(doc bson.Raw, _ int) bson.RawValue {
-								return doc.Lookup("_id")
-							},
-						)
+						ids, err := getDocIDs(ctx, coll, toDelete)
 
 						delRes, err := coll.DeleteMany(ctx, bson.D{{"_id", bson.D{{"$in", ids}}}})
 						if err == nil {
@@ -460,11 +437,18 @@ func doWork(ctx context.Context) error {
 func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 	// We use []bson.M for the outer stages (as requested),
 	// but strictly use bson.D for the operators to avoid invalid map usage.
+
+	randVal := lo.Ternary[any](
+		VersionAtLeast(versionArray[:], 4, 4),
+		bson.D{{"$rand", bson.D{}}},
+		rand.Float64(),
+	)
+
 	pipeline := []bson.M{
 		//{"$match": bson.D{{"$sampleRate", 0.01}}},
 		//{"$limit": newDocsCount},
 
-		{"$addFields": bson.D{{"randVal", bson.D{{"$rand", bson.D{}}}}}},
+		{"$addFields": bson.D{{"randVal", randVal}}},
 
 		{"$addFields": bson.D{
 			{"touchedByProcess", bson.D{{"$cond", bson.A{
@@ -482,7 +466,7 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 					bson.D{{"$gte", bson.A{"$randVal", 0.2}}},
 					bson.D{{"$lt", bson.A{"$randVal", 0.4}}},
 				}}},
-				bson.D{{"$lt", bson.A{bson.D{{"$rand", bson.D{}}}, 0.5}}},
+				bson.D{{"$lt", bson.A{randVal, 0.5}}},
 				"$flag",
 			}}}},
 			{"score", bson.D{{"$cond", bson.A{
@@ -490,7 +474,7 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 					bson.D{{"$gte", bson.A{"$randVal", 0.4}}},
 					bson.D{{"$lt", bson.A{"$randVal", 0.6}}},
 				}}},
-				bson.D{{"$floor", bson.D{{"$multiply", bson.A{bson.D{{"$rand", bson.D{}}}, 1000}}}}},
+				bson.D{{"$floor", bson.D{{"$multiply", bson.A{randVal, 1000}}}}},
 				"$score",
 			}}}},
 			{"visitCount", bson.D{{"$cond", bson.A{
@@ -518,15 +502,6 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 		}},
 
 		{"$project": bson.D{{"randVal", 0}}},
-
-		/*
-			{"$merge": bson.D{
-				{"into", collName},
-				{"on", "_id"},
-				{"whenMatched", "replace"},
-				{"whenNotMatched", "insert"},
-			}},
-		*/
 	}
 
 	/*
@@ -536,27 +511,61 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 		}
 	*/
 
-	res := coll.Database().RunCommand(
-		ctx,
-		bson.D{
-			{"update", coll.Name()},
-			{"ordered", false},
-			{"updates", []bson.D{
-				{
-					{"q", bson.D{{"$sampleRate", 0.01}}},
-					{"u", pipeline},
-					{"multi", true},
-				},
-			}},
-		},
-	)
-	raw, err := res.Raw()
+	if VersionAtLeast(versionArray[:], 4, 4) {
 
-	if err != nil {
-		return 0, err
+		res := coll.Database().RunCommand(
+			ctx,
+			bson.D{
+				{"update", coll.Name()},
+				{"ordered", false},
+				{"updates", []bson.D{
+					{
+						{"q", bson.D{{"$sampleRate", 0.01}}},
+						{"u", pipeline},
+						{"multi", true},
+					},
+				}},
+			},
+		)
+		raw, err := res.Raw()
+
+		if err != nil {
+			return 0, err
+		}
+
+		return bsontools.RawLookup[int32](raw, "nModified")
 	}
 
-	return bsontools.RawLookup[int32](raw, "nModified")
+	ids, err := getDocIDs(ctx, coll, 100_000)
+	if err != nil {
+		return 0, fmt.Errorf("fetching doc IDs: %w", err)
+	}
+
+	cursor, err := coll.Aggregate(
+		ctx,
+		append(
+			[]bson.M{
+				{"$match": bson.M{
+					"_id": bson.M{"$in": ids},
+				}},
+			},
+			append(
+				pipeline,
+				bson.M{"$merge": bson.M{
+					"into":           coll.Name(),
+					"on":             "_id",
+					"whenMatched":    "replace",
+					"whenNotMatched": "insert",
+				}},
+			)...,
+		),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("")
+	}
+	cursor.Close(ctx)
+
+	return int32(len(ids)), nil
 }
 
 func performInsert(ctx context.Context, coll *mongo.Collection, size int, useCustomID bool) (int, error) {
@@ -584,6 +593,32 @@ func performInsert(ctx context.Context, coll *mongo.Collection, size int, useCus
 		return 0, err
 	}
 	return len(res.InsertedIDs), nil
+}
+
+func getDocIDs[T constraints.Integer](ctx context.Context, coll *mongo.Collection, count T) ([]bson.RawValue, error) {
+	cursor, err := coll.Aggregate(
+		ctx,
+		mongo.Pipeline{
+			{{"$sample", bson.D{{"size", count}}}},
+			{{"$project", bson.D{{"_id", 1}}}},
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get %d doc IDs: %w", count, err)
+	}
+
+	var docs []bson.Raw
+	err = cursor.All(ctx, &docs)
+	if err != nil {
+		return nil, fmt.Errorf("read %d doc IDs: %w", count, err)
+	}
+
+	return lo.Map(
+		docs,
+		func(doc bson.Raw, _ int) bson.RawValue {
+			return doc.Lookup("_id")
+		},
+	), nil
 }
 
 func getCollectionName(useCustomID bool, size int) string {
