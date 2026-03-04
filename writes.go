@@ -246,6 +246,7 @@ func run(ctx context.Context) error {
 
 	for range startWorkers {
 		addWorker()
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	popWorker := func() bool {

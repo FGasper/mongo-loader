@@ -3,7 +3,7 @@ load("./shard.js");
 
 const one_tib = Math.pow(2, 40);
 
-const totalDataSize = one_tib * getShardNames().length;
+const totalDataSize = one_tib * (clusterIsSharded() ? getShardNames().length : 5);
 
 if (totalDataSize === 0) {
     throw "Huh?? 0 shards??";
