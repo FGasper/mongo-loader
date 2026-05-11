@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -88,6 +89,25 @@ func main() {
 					startWorkers = cmd.Int("workers")
 					newDocsCount = cmd.Int("docsPerBatch")
 					return runModifyData(ctx)
+				},
+			},
+			{
+				Name:    "prune-data",
+				Aliases: []string{"pd"},
+				Usage:   "Delete a fraction of data across all collections",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					applySharedFlags(cmd)
+
+					if cmd.NArg() != 1 {
+						return fmt.Errorf("prune-data requires exactly one argument: the fraction (e.g., 0.001)")
+					}
+
+					fraction, err := strconv.ParseFloat(cmd.Args().Get(0), 64)
+					if err != nil {
+						return fmt.Errorf("invalid fraction: %w", err)
+					}
+
+					return runPruneData(ctx, cmd, fraction)
 				},
 			},
 		},
