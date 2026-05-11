@@ -1,0 +1,13 @@
+version: "2"
+
+linters:
+  settings:
+    govet:
+      disable:
+      - composites
+
+issues:
+  exclude-rules:
+    - linters:
+        - composites
+      pattern: "bson\\.E struct literal uses unkeyed fields"
