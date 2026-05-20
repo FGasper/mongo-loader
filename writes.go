@@ -25,6 +25,10 @@ import (
 	"golang.org/x/text/message"
 )
 
+const (
+	writesHistoryTTL = time.Minute
+)
+
 var (
 	newDocsCount  = 50000
 	docSizes      = []int{500, 1000, 2000}
@@ -38,7 +42,7 @@ var (
 
 	logLevel = slog.LevelInfo
 
-	writesHistory     = history.New[int](time.Minute)
+	writesHistory     = history.New[int](writesHistoryTTL)
 	brokenPipeHistory = history.New[int](time.Minute)
 
 	localizer = message.NewPrinter(language.English)
@@ -139,10 +143,7 @@ func runModifyData(ctx context.Context) (retErr error) {
 			logs := writesHistory.Get()
 			totalWrites := history.SumLogs(logs)
 
-			if len(logs) > 0 {
-				elapsed := time.Since(logs[0].At)
-				writesPerSecond = float64(totalWrites) / elapsed.Seconds()
-			}
+			writesPerSecond = float64(totalWrites) / writesHistoryTTL.Seconds()
 
 			pipeLogs := brokenPipeHistory.Get()
 			totalBrokenPipes := history.SumLogs(pipeLogs)
@@ -211,7 +212,7 @@ func runModifyData(ctx context.Context) (retErr error) {
 			popWorker()
 		}
 		return nil
-	}, oldState, true)
+	}, oldState, true, nil)
 }
 
 // A clean way to print in raw mode (since \n doesn't return carriage anymore)

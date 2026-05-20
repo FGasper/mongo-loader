@@ -34,9 +34,11 @@ var (
 	useServerSideAgg = false
 	sizeHistory      = history.New[int](time.Minute)
 	countHistory     = history.New[int](time.Minute)
+
+	errSwitchToModify = errors.New("switching to modify-data")
 )
 
-func runCreateData(ctx context.Context, _ any, docsPerBatch int) (retErr error) {
+func runCreateData(ctx context.Context, _ any, docsPerBatch int, modifyAfterGiB float64) (retErr error) {
 	client, err := mongo.Connect(options.Client().ApplyURI(uri))
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -123,8 +125,11 @@ func runCreateData(ctx context.Context, _ any, docsPerBatch int) (retErr error) 
 		return true
 	}
 
+	quit := make(chan struct{})
+	thresholdBytes := int64(modifyAfterGiB * (1 << 30))
+
 	// Start size logging goroutine
-	go logSizes(sigCtx)
+	go logSizes(sigCtx, thresholdBytes, quit)
 
 	// Start with 1 thread
 	printRaw("Starting 1 thread.")
@@ -138,7 +143,7 @@ func runCreateData(ctx context.Context, _ any, docsPerBatch int) (retErr error) 
 	defer restoreTerm()
 
 	// Keyboard input loop
-	return handleKeyboardInput(restoreTerm, func(isUp bool) error {
+	err = handleKeyboardInput(restoreTerm, func(isUp bool) error {
 		if !setupComplete {
 			slog.Warn("Doing nothing cuz sharding stuff still happening")
 			return nil
@@ -150,7 +155,18 @@ func runCreateData(ctx context.Context, _ any, docsPerBatch int) (retErr error) 
 			removeThread()
 		}
 		return nil
-	}, oldState, true)
+	}, oldState, true, quit)
+	if err != nil {
+		return err
+	}
+
+	// If quit was closed by the size monitor, signal the caller to switch modes.
+	select {
+	case <-quit:
+		return errSwitchToModify
+	default:
+		return nil
+	}
 }
 
 func performCreateInsert(ctx context.Context, coll *mongo.Collection, size int, useCustomID bool, docsPerBatch int) (int, error) {
@@ -313,9 +329,11 @@ func performCreateWork(ctx context.Context, docsPerBatch int) error {
 	}
 }
 
-func logSizes(ctx context.Context) {
+func logSizes(ctx context.Context, thresholdBytes int64, quit chan<- struct{}) {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
+
+	triggered := false
 
 	for {
 		select {
@@ -352,6 +370,15 @@ func logSizes(ctx context.Context) {
 					history.RatePer(sizeHistory.Get(), time.Second),
 				),
 			)
+
+			if !triggered && thresholdBytes > 0 && totalSize >= thresholdBytes {
+				triggered = true
+				slog.Info("GiB threshold reached, switching to modify-data",
+					"threshold", humantools.FmtBytes(thresholdBytes),
+					"current", humantools.FmtBytes(totalSize),
+				)
+				close(quit)
+			}
 		}
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -58,12 +59,21 @@ func main() {
 						Name:  "serverSideAgg",
 						Usage: "Use server-side aggregation (MongoDB 4.2+)",
 					},
+					&cli.FloatFlag{
+						Name:  "modify-after-gib",
+						Usage: "Switch to modify-data after this many GiB are created (0 = disabled)",
+					},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					applySharedFlags(cmd)
 					newDocsCount := cmd.Int("docsPerBatch")
 					useServerSideAgg = cmd.Bool("serverSideAgg")
-					return runCreateData(ctx, cmd, newDocsCount)
+					modifyAfterGiB := cmd.Float("modify-after-gib")
+					err := runCreateData(ctx, cmd, newDocsCount, modifyAfterGiB)
+					if errors.Is(err, errSwitchToModify) {
+						return runModifyData(ctx)
+					}
+					return err
 				},
 			},
 			{
@@ -173,55 +183,76 @@ func setupTerminalRawMode() (*term.State, func(), error) {
 // handleKeyboardInput processes terminal input in raw mode.
 // If setupComplete is false, arrow keys are ignored.
 // onArrow is called for arrow keys (when setupComplete is true).
-func handleKeyboardInput(restoreTerm func(), onArrow func(isUp bool) error, oldState *term.State, setupComplete bool) error {
-	b := make([]byte, 3)
+// quit, if non-nil, causes the function to return nil when closed.
+func handleKeyboardInput(restoreTerm func(), onArrow func(isUp bool) error, oldState *term.State, setupComplete bool, quit <-chan struct{}) error {
+	type readResult struct {
+		b   [3]byte
+		n   int
+		err error
+	}
+	readCh := make(chan readResult, 1)
+	go func() {
+		for {
+			var r readResult
+			r.n, r.err = os.Stdin.Read(r.b[:])
+			readCh <- r
+			if r.err != nil {
+				return
+			}
+		}
+	}()
 
 	for {
-		n, err := os.Stdin.Read(b)
-		if err != nil {
-			return fmt.Errorf("read stdin: %w", err)
-		}
-
-		if n == 0 {
-			continue
-		}
-
-		switch b[0] {
-		case '\x03': // CTRL-C
+		select {
+		case <-quit:
 			return nil
-		case '\x1a': // CTRL-Z
-			restoreTerm()
-
-			// Register for SIGCONT before stopping
-			contC := make(chan os.Signal, 1)
-			signal.Notify(contC, syscall.SIGCONT)
-
-			// Now stop — terminal is already restored
-			p, _ := os.FindProcess(os.Getpid())
-			_ = p.Signal(syscall.SIGSTOP)
-
-			// Block until SIGCONT (fg command)
-			<-contC
-			signal.Stop(contC)
-
-			// Re-enter raw mode
-			var err2 error
-			oldState, err2 = term.MakeRaw(int(os.Stdin.Fd()))
-			if err2 != nil {
-				return fmt.Errorf("re-entering raw mode: %w", err2)
+		case r := <-readCh:
+			n, b := r.n, r.b[:]
+			if r.err != nil {
+				return fmt.Errorf("read stdin: %w", r.err)
 			}
-		case '\x0d': // Enter
-			slog.Info("Status: ready")
-		case '\x1b': // Escape sequence
-			if n >= 3 && b[1] == '[' {
-				switch b[2] {
-				case 'A': // up arrow
-					if err := onArrow(true); err != nil {
-						return err
-					}
-				case 'B': // down arrow
-					if err := onArrow(false); err != nil {
-						return err
+
+			if n == 0 {
+				continue
+			}
+
+			switch b[0] {
+			case '\x03': // CTRL-C
+				return nil
+			case '\x1a': // CTRL-Z
+				restoreTerm()
+
+				// Register for SIGCONT before stopping
+				contC := make(chan os.Signal, 1)
+				signal.Notify(contC, syscall.SIGCONT)
+
+				// Now stop — terminal is already restored
+				p, _ := os.FindProcess(os.Getpid())
+				_ = p.Signal(syscall.SIGSTOP)
+
+				// Block until SIGCONT (fg command)
+				<-contC
+				signal.Stop(contC)
+
+				// Re-enter raw mode
+				var err2 error
+				oldState, err2 = term.MakeRaw(int(os.Stdin.Fd()))
+				if err2 != nil {
+					return fmt.Errorf("re-entering raw mode: %w", err2)
+				}
+			case '\x0d': // Enter
+				slog.Info("Status: ready")
+			case '\x1b': // Escape sequence
+				if n >= 3 && b[1] == '[' {
+					switch b[2] {
+					case 'A': // up arrow
+						if err := onArrow(true); err != nil {
+							return err
+						}
+					case 'B': // down arrow
+						if err := onArrow(false); err != nil {
+							return err
+						}
 					}
 				}
 			}
