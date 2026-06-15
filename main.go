@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -76,7 +77,7 @@ func main() {
 					modifyAfterGiB := cmd.Float("modify-after-gib")
 					err := runCreateData(ctx, cmd, newDocsCount, modifyAfterGiB)
 					if errors.Is(err, errSwitchToModify) {
-						return runModifyData(ctx)
+						return runModifyData(ctx, profileBalanced)
 					}
 					return err
 				},
@@ -98,6 +99,13 @@ func main() {
 						Value:   newDocsCount,
 						Usage:   "Number of documents to insert per batch",
 					},
+					&cli.StringFlag{
+						Name: "profile",
+						Usage: fmt.Sprintf(
+							"load profile to use (options: %q)", writeProfiles,
+						),
+						Value: string(writeProfiles[0]),
+					},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					applySharedFlags(cmd)
@@ -109,7 +117,12 @@ func main() {
 						return fmt.Errorf("sampleRate must be in the range (0, 1], got %f", sampleRate)
 					}
 
-					return runModifyData(ctx)
+					profileName := cmd.String("profile")
+					if !slices.Contains(writeProfiles, writeProfile(profileName)) {
+						return fmt.Errorf("invalid profile %q (need one of: %q)", profileName, writeProfiles)
+					}
+
+					return runModifyData(ctx, writeProfile(profileName))
 				},
 			},
 			{

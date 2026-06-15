@@ -28,8 +28,13 @@ import (
 	"golang.org/x/text/message"
 )
 
+type writeProfile string
+
 const (
-	writesHistoryTTL = time.Minute
+	profileBalanced   writeProfile = "balanced"
+	profileUpdateOnly writeProfile = "update-only"
+
+	writesHistoryTTL = 5 * time.Minute
 
 	maxSubmissionSize = 15 << 20 // leave some headroom from the 16 MiB BSON document limit
 )
@@ -52,9 +57,14 @@ var (
 	brokenPipeHistory = history.New[int](time.Minute)
 
 	localizer = message.NewPrinter(language.English)
+
+	writeProfiles = []writeProfile{profileBalanced, profileUpdateOnly}
 )
 
-func runModifyData(ctx context.Context) (retErr error) {
+func runModifyData(
+	ctx context.Context,
+	profile writeProfile,
+) (retErr error) {
 	client, err := mongo.Connect(options.Client().
 		ApplyURI(uri).
 		SetAppName("mongo-writer"),
@@ -117,7 +127,7 @@ func runModifyData(ctx context.Context) (retErr error) {
 			}()
 
 			for {
-				if err := doWork(workerCtx, workerNum, &statePtr); err != nil {
+				if err := doWork(workerCtx, workerNum, profile, &statePtr); err != nil {
 					if errors.Is(err, context.Canceled) {
 						break
 					}
@@ -141,6 +151,8 @@ func runModifyData(ctx context.Context) (retErr error) {
 		}()
 	}
 
+	startTime := time.Now()
+
 	go func() {
 		time.Sleep(5 * time.Second)
 
@@ -150,7 +162,8 @@ func runModifyData(ctx context.Context) (retErr error) {
 			logs := writesHistory.Get()
 			totalWrites := history.SumLogs(logs)
 
-			writesPerSecond = float64(totalWrites) / writesHistoryTTL.Seconds()
+			window := min(writesHistoryTTL, time.Since(startTime))
+			writesPerSecond = float64(totalWrites) / window.Seconds()
 
 			pipeLogs := brokenPipeHistory.Get()
 			totalBrokenPipes := history.SumLogs(pipeLogs)
@@ -240,6 +253,7 @@ func printRaw(s any) {
 func doWork(
 	ctx context.Context,
 	workerNum int,
+	profile writeProfile,
 	statePtr *atomic.Pointer[string],
 ) error {
 	logger := slog.Default().With("worker", workerNum)
@@ -272,16 +286,17 @@ func doWork(
 		var attrs []slog.Attr
 
 		totalDeleted := 0
+		inserted := 0
 
 		// --- 1. INSERT ---
-		/*
+		if profile == "balanced" {
 			logger.Debug("Inserting documents.",
 				"collection", collName,
 				"count", localizer.Sprintf("%d", newDocsCount),
 			)
 
 			statePtr.Store(new("insert"))
-			inserts, err := performInsert(
+			inserted, err = performInsert(
 				ctx,
 				coll,
 				curMatrixItem.docSize,
@@ -293,18 +308,18 @@ func doWork(
 
 			logger.Debug("Inserted documents.",
 				"collection", collName,
-				"count", localizer.Sprintf("%d", inserts),
+				"count", localizer.Sprintf("%d", inserted),
 			)
 
-			writesHistory.Add(inserts)
+			writesHistory.Add(inserted)
 
-			attrs = append(attrs, slog.Int("inserts", inserts))
-		*/
+			attrs = append(attrs, slog.Int("inserted", inserted))
+		}
 
 		// --------------------
 		statePtr.Store(new("update-simple"))
 		// --- 2. SIMPLE UPDATE ---
-		logger.Debug("Simple updating documents.",
+		logger.Debug("Updating documents via update operators.",
 			"collection", collName,
 		)
 
@@ -313,7 +328,7 @@ func doWork(
 			return fmt.Errorf("simple update: %w", err)
 		}
 
-		logger.Debug("Simple updated documents.",
+		logger.Debug("Updated documents via update operators.",
 			"collection", collName,
 			"count", localizer.Sprintf("%d", simpleUpdates),
 		)
@@ -324,9 +339,9 @@ func doWork(
 
 		// -------------------------
 		// --- 3. UPDATE ---
-		statePtr.Store(new("update-pipeline"))
+		statePtr.Store(new("update-aggregation"))
 
-		logger.Debug("Updating documents.",
+		logger.Debug("Updating documents via aggregation.",
 			"collection", collName,
 		)
 
@@ -335,7 +350,7 @@ func doWork(
 			return fmt.Errorf("update: %w", err)
 		}
 
-		logger.Debug("Updated documents.",
+		logger.Debug("Updated documents via aggregation.",
 			"collection", collName,
 			"count", localizer.Sprintf("%d", updates),
 		)
@@ -346,18 +361,17 @@ func doWork(
 
 		// -------------------------
 		// --- 3. DELETE ---
-		/*
+		if profile == "balanced" {
 			statePtr.Store(new("delete-count"))
 			logger.Debug("Counting documents to delete.")
 			curr := lo.Must(coll.EstimatedDocumentCount(ctx))
 
-			toDelete := inserts
+			toDelete := inserted
 
 			coll = coll.Database().Collection(
 				coll.Name(),
 				options.Collection().SetWriteConcern(writeconcern.W1()),
 			)
-
 
 			if useSampleRate() {
 				fraction := float64(toDelete) / float64(curr)
@@ -411,7 +425,7 @@ func doWork(
 					return fmt.Errorf("delete: %w", err)
 				}
 			}
-		*/
+		}
 
 		attrs = append(
 			attrs,
