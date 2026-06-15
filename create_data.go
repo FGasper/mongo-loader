@@ -178,22 +178,19 @@ func performCreateInsert(ctx context.Context, coll *mongo.Collection, size int, 
 		_, loaded := seedsCreated.LoadOrStore(collName, struct{}{})
 		if !loaded {
 			// First time seeing this collection in this process
-			res := coll.Database().RunCommand(ctx, bson.D{
-				{"insert", collName},
-				{"documents", []bson.D{
-					{
-						{"_id", "$$seed$$"},
-						{"str", ""},
-						{"num", 0.0},
-						{"a", 1},
-					},
-				}},
-				{"ordered", false},
-			})
+			_, err := coll.Database().Collection(collName).InsertOne(
+				ctx,
+				bson.D{
+					{"_id", "$$seed$$"},
+					{"str", ""},
+					{"num", 0.0},
+					{"a", 1},
+				},
+			)
 
 			// Ignore duplicate key errors (E11000)
-			if err := res.Err(); err != nil {
-				if writeEx, ok := err.(mongo.WriteException); ok && len(writeEx.WriteErrors) > 0 && writeEx.WriteErrors[0].Code == 11000 {
+			if err != nil {
+				if mongo.IsDuplicateKeyError(err) {
 					// Duplicate key error, that's fine
 				} else {
 					return 0, fmt.Errorf("seed insert: %w", err)
@@ -213,14 +210,14 @@ func performCreateInsert(ctx context.Context, coll *mongo.Collection, size int, 
 
 		// Run aggregation to generate and merge documents server-side
 		pipeline := mongo.Pipeline{
-			{{Key: "$match", Value: bson.D{{Key: "_id", Value: "$$seed$$"}}}},
-			{{Key: "$addFields", Value: bson.D{{Key: "batchIndex", Value: bson.D{{Key: "$range", Value: bson.A{0, docsPerBatch}}}}}}},
-			{{Key: "$unwind", Value: "$batchIndex"}},
-			{{Key: "$replaceRoot", Value: bson.D{{Key: "newRoot", Value: newRoot}}}},
-			{{Key: "$merge", Value: bson.D{
-				{Key: "into", Value: collName},
-				{Key: "whenMatched", Value: "keepExisting"},
-				{Key: "whenNotMatched", Value: "insert"},
+			{{"$match", bson.D{{"_id", "$$seed$$"}}}},
+			{{"$addFields", bson.D{{"batchIndex", bson.D{{"$range", bson.A{0, docsPerBatch}}}}}}},
+			{{"$unwind", "$batchIndex"}},
+			{{"$replaceRoot", bson.D{{"newRoot", newRoot}}}},
+			{{"$merge", bson.D{
+				{"into", collName},
+				{"whenMatched", "keepExisting"},
+				{"whenNotMatched", "insert"},
 			}}},
 		}
 
@@ -292,7 +289,7 @@ func performCreateInsert(ctx context.Context, coll *mongo.Collection, size int, 
 
 	coll = coll.Database().Collection(
 		coll.Name(),
-		options.Collection().SetWriteConcern(writeconcern.Unacknowledged()),
+		options.Collection().SetWriteConcern(writeconcern.W1()),
 	)
 
 	res, err := coll.InsertMany(
@@ -303,7 +300,7 @@ func performCreateInsert(ctx context.Context, coll *mongo.Collection, size int, 
 			SetOrdered(false),
 	)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("insert batch: %w", err)
 	}
 
 	sizeHistory.Add(totalSize)

@@ -42,6 +42,11 @@ func main() {
 				Name:  "debug",
 				Usage: "Enable debug level logging",
 			},
+			&cli.Float64Flag{
+				Name:  "sampleRate",
+				Usage: "The fraction of documents updated in each batch.",
+				Value: 0.01,
+			},
 		},
 		Commands: []*cli.Command{
 			{
@@ -98,6 +103,12 @@ func main() {
 					applySharedFlags(cmd)
 					startWorkers = cmd.Int("workers")
 					newDocsCount = cmd.Int("docsPerBatch")
+
+					sampleRate = cmd.Float64("sampleRate")
+					if sampleRate <= 0 || sampleRate > 1 {
+						return fmt.Errorf("sampleRate must be in the range (0, 1], got %f", sampleRate)
+					}
+
 					return runModifyData(ctx)
 				},
 			},

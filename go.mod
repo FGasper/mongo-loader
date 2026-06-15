@@ -1,6 +1,6 @@
 module github.com/FGasper/mongo-writer
 
-go 1.25.7
+go 1.26
 
 require (
 	github.com/MatusOllah/slogcolor v1.7.0

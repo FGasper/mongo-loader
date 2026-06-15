@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/rand/v2"
+	"sync"
 
 	pool "github.com/libp2p/go-buffer-pool"
 )
@@ -11,13 +12,18 @@ const humanCharset = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 var charsetLen = len(humanCharset)
 
+var rngPool = sync.Pool{
+	New: func() any {
+		return rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	},
+}
+
 func randomString(n int) string {
 	b := pool.Get(n)
 	defer pool.Put(b)
 
-	// Use a larger random value and extract multiple characters from it
-	// to reduce the number of rand calls (most expensive operation)
-	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	rng := rngPool.Get().(*rand.Rand)
+	defer rngPool.Put(rng)
 
 	for i := 0; i < n; {
 		// Generate a 64-bit random number and extract characters

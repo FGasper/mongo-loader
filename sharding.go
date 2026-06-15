@@ -15,7 +15,6 @@ import (
 func clusterIsSharded(ctx context.Context, client *mongo.Client) bool {
 	admin := client.Database("admin")
 	result := admin.RunCommand(ctx, bson.D{{Key: "getShardMap", Value: 1}})
-	fmt.Printf("result: ")
 	return result.Err() == nil
 }
 

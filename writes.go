@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
@@ -27,18 +30,21 @@ import (
 
 const (
 	writesHistoryTTL = time.Minute
+
+	maxSubmissionSize = 15 << 20 // leave some headroom from the 16 MiB BSON document limit
 )
 
 var (
-	newDocsCount  = 50000
-	docSizes      = []int{500, 1000, 2000}
+	newDocsCount = 50000
+	docSizes     = []int{500, 1000, 2000}
+	sampleRate   = 0.01
+
 	customIDModes = []bool{true, false}
 	startWorkers  = 5
 	uri           = "mongodb://localhost:27017"
 
-	versionArray     [3]int
-	db               *mongo.Database
-	allOldDocsCounts = make(map[string]int64)
+	versionArray [3]int
+	db           *mongo.Database
 
 	logLevel = slog.LevelInfo
 
@@ -49,30 +55,26 @@ var (
 )
 
 func runModifyData(ctx context.Context) (retErr error) {
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	client, err := mongo.Connect(options.Client().
+		ApplyURI(uri).
+		SetAppName("mongo-writer"),
+	)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer func() { _ = client.Disconnect(ctx) }()
 
 	db = client.Database("test")
+
+	setupLogging()
+
 	var err2 error
 	versionArray, err2 = GetVersionArray(ctx, client)
 	if err2 != nil {
 		return err2
 	}
 
-	setupLogging()
-
-	for _, docSize := range docSizes {
-		for _, useCustomID := range customIDModes {
-			collName := getCollectionName(useCustomID, docSize)
-			coll := db.Collection(collName)
-
-			count := lo.Must(coll.EstimatedDocumentCount(ctx))
-			allOldDocsCounts[collName] = count
-		}
-	}
+	slog.Info("Found cluster version", "version", versionArray)
 
 	//----------------------------------------------
 
@@ -92,12 +94,16 @@ func runModifyData(ctx context.Context) (retErr error) {
 	//----------------------------------------------
 
 	workerCancel := xsync.NewMap[int, context.CancelCauseFunc]()
+	workerState := xsync.NewMap[int, *atomic.Pointer[string]]() // purely for logging purposes
 
 	addWorker := func() {
 		workerNum := workerCancel.Size()
 
 		workerCtx, canceler := context.WithCancelCause(ctx)
 		workerCancel.Store(workerNum, canceler)
+
+		statePtr := atomic.Pointer[string]{}
+		workerState.Store(workerNum, &statePtr)
 
 		go func() {
 			defer func() {
@@ -107,10 +113,11 @@ func runModifyData(ctx context.Context) (retErr error) {
 				canceler(fmt.Errorf("worker %d ending", workerNum))
 
 				slog.Info("Worker ended.", "remaining", workerCancel.Size())
+				workerState.Delete(workerNum)
 			}()
 
 			for {
-				if err := doWork(workerCtx); err != nil {
+				if err := doWork(workerCtx, workerNum, &statePtr); err != nil {
 					if errors.Is(err, context.Canceled) {
 						break
 					}
@@ -156,9 +163,19 @@ func runModifyData(ctx context.Context) (retErr error) {
 				failurePercentage = (float64(totalBrokenPipes) / float64(totalWrites+totalBrokenPipes)) * 100
 			}
 
+			workerStateCounts := map[string]int{}
+			workerState.RangeRelaxed(func(key int, value *atomic.Pointer[string]) bool {
+				state := value.Load()
+				if state != nil && *state != "" {
+					workerStateCounts[*state]++
+				}
+				return true
+			})
+
 			attrs := []any{
 				"writesPerSecond", localizer.Sprintf("%.02f", writesPerSecond),
 				"batches", len(logs),
+				"workerStates", workerStateCounts,
 			}
 			if brokenPipesPerSecond > 0 {
 				attrs = append(attrs, "brokenPipesPerSecond", localizer.Sprintf("%.02f", brokenPipesPerSecond))
@@ -220,160 +237,202 @@ func printRaw(s any) {
 	fmt.Print(s, "\r\n")
 }
 
-func doWork(ctx context.Context) error {
-	srcVersion, err := GetVersionArray(ctx, db.Client())
-	if err != nil {
-		return fmt.Errorf("getting source version: %w", err)
+func doWork(
+	ctx context.Context,
+	workerNum int,
+	statePtr *atomic.Pointer[string],
+) error {
+	logger := slog.Default().With("worker", workerNum)
+
+	type matrixItem struct {
+		docSize     int
+		useCustomID bool
+	}
+	var matrix []matrixItem
+
+	for _, docSize := range docSizes {
+		for _, useCustomID := range customIDModes {
+			matrix = append(matrix, matrixItem{
+				docSize:     docSize,
+				useCustomID: useCustomID,
+			})
+		}
 	}
 
 	for {
-		for _, docSize := range docSizes {
-			for _, useCustomID := range customIDModes {
-				collName := getCollectionName(useCustomID, docSize)
-				coll := db.Collection(collName)
+		curMatrixItem := lo.Sample(matrix)
 
-				startTime := time.Now()
+		collName := getCollectionName(curMatrixItem.useCustomID, curMatrixItem.docSize)
+		coll := db.Collection(collName)
 
-				baseline := allOldDocsCounts[collName]
+		startTime := time.Now()
 
-				var err error
+		var err error
 
-				// --- 1. INSERT ---
-				slog.Debug("Inserting documents.",
-					"collection", collName,
-					"count", localizer.Sprintf("%d", newDocsCount),
-				)
+		var attrs []slog.Attr
 
-				var attrs []slog.Attr
+		totalDeleted := 0
 
-				inserts, err := performInsert(ctx, coll, docSize, useCustomID)
-				if err != nil {
-					return fmt.Errorf("insert: %w", err)
-				}
+		// --- 1. INSERT ---
+		/*
+			logger.Debug("Inserting documents.",
+				"collection", collName,
+				"count", localizer.Sprintf("%d", newDocsCount),
+			)
 
-				slog.Debug("Inserted documents.",
-					"collection", collName,
-					"count", localizer.Sprintf("%d", inserts),
-				)
-
-				writesHistory.Add(inserts)
-
-				attrs = append(attrs, slog.Int("inserts", inserts))
-
-				// --- 2. SIMPLE UPDATE ---
-				slog.Debug("Simple updating documents.",
-					"collection", collName,
-				)
-
-				simpleUpdates, err := performSimpleUpdate(ctx, coll)
-				if err != nil {
-					return fmt.Errorf("simple update: %w", err)
-				}
-
-				slog.Debug("Simple updated documents.",
-					"collection", collName,
-					"count", localizer.Sprintf("%d", simpleUpdates),
-				)
-
-				writesHistory.Add(int(simpleUpdates))
-
-				attrs = append(attrs, slog.Int("simpleUpdates", int(simpleUpdates)))
-
-				// --- 3. UPDATE ---
-				slog.Debug("Updating documents.",
-					"collection", collName,
-				)
-
-				updates, err := performUpdate(ctx, coll)
-				if err != nil {
-					return fmt.Errorf("update: %w", err)
-				}
-
-				slog.Debug("Updated documents.",
-					"collection", collName,
-					"count", localizer.Sprintf("%d", updates),
-				)
-
-				writesHistory.Add(int(updates))
-
-				attrs = append(attrs, slog.Int("updates", int(updates)))
-
-				// --- 3. DELETE ---
-				totalDeleted := 0
-				for {
-					curr, _ := coll.EstimatedDocumentCount(ctx)
-
-					toDelete := curr - baseline
-
-					if toDelete < 1 {
-						break
-					}
-
-					fraction := float64(toDelete) / float64(curr)
-
-					slog.Debug("Deleting random documents.",
-						"collection", collName,
-						"count", localizer.Sprintf("%d", toDelete),
-						"fraction", localizer.Sprintf("%f", fraction),
-					)
-
-					coll := coll.Database().Collection(
-						coll.Name(),
-						options.Collection().SetWriteConcern(writeconcern.Unacknowledged()),
-					)
-
-					if VersionAtLeast(srcVersion[:], 4, 4) {
-						delRes, err := coll.DeleteMany(ctx, bson.D{{"$sampleRate", fraction}})
-						if err == nil {
-							slog.Debug("Deleted documents.",
-								"collection", collName,
-								"count", localizer.Sprintf("%d", delRes.DeletedCount),
-							)
-
-							writesHistory.Add(int(delRes.DeletedCount))
-							totalDeleted += int(delRes.DeletedCount)
-						} else {
-							return fmt.Errorf("delete: %w", err)
-						}
-					} else {
-						ids, err := getDocIDs(ctx, coll, toDelete)
-						if err != nil {
-							return fmt.Errorf("getting doc IDs for delete: %w", err)
-						}
-
-						delRes, err := coll.DeleteMany(ctx, bson.D{{"_id", bson.D{{"$in", ids}}}})
-						if err == nil {
-							slog.Debug("Deleted documents.",
-								"collection", collName,
-								"count", localizer.Sprintf("%d", delRes.DeletedCount),
-							)
-
-							writesHistory.Add(int(delRes.DeletedCount))
-							totalDeleted += int(delRes.DeletedCount)
-						} else {
-							return fmt.Errorf("delete: %w", err)
-						}
-					}
-				}
-
-				attrs = append(
-					attrs,
-					slog.String("deleted", localizer.Sprintf("%d", totalDeleted)),
-					slog.Duration("elapsed", time.Since(startTime)),
-					slog.String("collection", collName),
-				)
-
-				slog.Debug("Writes sent.", lo.ToAnySlice(attrs)...)
+			statePtr.Store(new("insert"))
+			inserts, err := performInsert(
+				ctx,
+				coll,
+				curMatrixItem.docSize,
+				curMatrixItem.useCustomID,
+			)
+			if err != nil {
+				return fmt.Errorf("insert: %w", err)
 			}
+
+			logger.Debug("Inserted documents.",
+				"collection", collName,
+				"count", localizer.Sprintf("%d", inserts),
+			)
+
+			writesHistory.Add(inserts)
+
+			attrs = append(attrs, slog.Int("inserts", inserts))
+		*/
+
+		// --------------------
+		statePtr.Store(new("update-simple"))
+		// --- 2. SIMPLE UPDATE ---
+		logger.Debug("Simple updating documents.",
+			"collection", collName,
+		)
+
+		simpleUpdates, err := performSimpleUpdate(ctx, coll)
+		if err != nil {
+			return fmt.Errorf("simple update: %w", err)
 		}
+
+		logger.Debug("Simple updated documents.",
+			"collection", collName,
+			"count", localizer.Sprintf("%d", simpleUpdates),
+		)
+
+		writesHistory.Add(int(simpleUpdates))
+
+		attrs = append(attrs, slog.Int("simpleUpdates", int(simpleUpdates)))
+
+		// -------------------------
+		// --- 3. UPDATE ---
+		statePtr.Store(new("update-pipeline"))
+
+		logger.Debug("Updating documents.",
+			"collection", collName,
+		)
+
+		updates, err := performUpdate(ctx, coll)
+		if err != nil {
+			return fmt.Errorf("update: %w", err)
+		}
+
+		logger.Debug("Updated documents.",
+			"collection", collName,
+			"count", localizer.Sprintf("%d", updates),
+		)
+
+		writesHistory.Add(int(updates))
+
+		attrs = append(attrs, slog.Int("updates", int(updates)))
+
+		// -------------------------
+		// --- 3. DELETE ---
+		/*
+			statePtr.Store(new("delete-count"))
+			logger.Debug("Counting documents to delete.")
+			curr := lo.Must(coll.EstimatedDocumentCount(ctx))
+
+			toDelete := inserts
+
+			coll = coll.Database().Collection(
+				coll.Name(),
+				options.Collection().SetWriteConcern(writeconcern.W1()),
+			)
+
+
+			if useSampleRate() {
+				fraction := float64(toDelete) / float64(curr)
+
+				logger.Debug("Deleting random documents.",
+					"collection", collName,
+					"countToDelete", localizer.Sprintf("%d", toDelete),
+					"deleteFraction", localizer.Sprintf("%f", fraction),
+				)
+
+				statePtr.Store(new("delete-sample"))
+				delRes, err := coll.DeleteMany(ctx, bson.D{{"$sampleRate", fraction}})
+				if err == nil {
+					logger.Debug("Deleted documents.",
+						"collection", collName,
+						"count", localizer.Sprintf("%d", delRes.DeletedCount),
+					)
+
+					writesHistory.Add(int(delRes.DeletedCount))
+					totalDeleted += int(delRes.DeletedCount)
+				} else {
+					return fmt.Errorf("delete: %w", err)
+				}
+			} else {
+				logger.Debug("Fetching random documents to delete.",
+					"collection", collName,
+					"countToDelete", localizer.Sprintf("%d", toDelete),
+				)
+
+				statePtr.Store(new("delete-fetch"))
+				ids, err := getDocIDs(ctx, coll, toDelete)
+				if err != nil {
+					return fmt.Errorf("getting doc IDs for delete: %w", err)
+				}
+
+				logger.Debug("Deleting random documents.",
+					"collection", collName,
+				)
+
+				statePtr.Store(new("delete-docs"))
+				delRes, err := coll.DeleteMany(ctx, bson.D{{"_id", bson.D{{"$in", ids}}}})
+				if err == nil {
+					logger.Debug("Deleted documents.",
+						"collection", collName,
+						"count", localizer.Sprintf("%d", delRes.DeletedCount),
+					)
+
+					writesHistory.Add(int(delRes.DeletedCount))
+					totalDeleted += int(delRes.DeletedCount)
+				} else {
+					return fmt.Errorf("delete: %w", err)
+				}
+			}
+		*/
+
+		attrs = append(
+			attrs,
+			slog.String("deleted", localizer.Sprintf("%d", totalDeleted)),
+			slog.Duration("elapsed", time.Since(startTime)),
+			slog.String("collection", collName),
+		)
+
+		logger.Debug("Writes sent.", lo.ToAnySlice(attrs)...)
 	}
+}
+
+func useSampleRate() bool {
+	return VersionAtLeast(versionArray[:], 4, 4)
 }
 
 func performSimpleUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 	var query bson.D
 
-	if VersionAtLeast(versionArray[:], 4, 4) {
-		query = bson.D{{"$sampleRate", 0.01}}
+	if useSampleRate() {
+		query = bson.D{{"$sampleRate", sampleRate}}
 	} else {
 		ids, err := getDocIDs(ctx, coll, 50_000)
 		if err != nil {
@@ -494,8 +553,8 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 	if VersionAtLeast(versionArray[:], 4, 2) {
 		var query bson.D
 
-		if VersionAtLeast(versionArray[:], 4, 4) {
-			query = bson.D{{"$sampleRate", 0.01}}
+		if useSampleRate() {
+			query = bson.D{{"$sampleRate", sampleRate}}
 		} else {
 			ids, err := getDocIDs(ctx, coll, 50_000)
 			if err != nil {
@@ -562,28 +621,53 @@ func performUpdate(ctx context.Context, coll *mongo.Collection) (int32, error) {
 }
 
 func performInsert(ctx context.Context, coll *mongo.Collection, size int, useCustomID bool) (int, error) {
-	newDocs := make([]any, newDocsCount)
 
 	// Assume that about 1/3 of each user document is keys, which are
 	// mostly identical across documents.
 	baseString := randomString(size / 3)
 
-	for i := 0; i < newDocsCount; i++ {
-		doc := bson.M{
-			"rand":        rand.Float64(),
-			"str":         baseString + randomString(2*size/3),
-			"num":         rand.Float64(),
-			"fromUpdates": true,
-		}
+	newDocs := make([]bson.Raw, 0, newDocsCount)
+
+	totalSize := 0
+
+	for range newDocsCount {
+		curStr := baseString + randomString(2*size/3)
+
+		docSize := 4 +
+			len(bsoncore.AppendDoubleElement(nil, "rand", 0)) +
+			len(bsoncore.AppendStringElement(nil, "str", "")) +
+			len(curStr) +
+			len(bsoncore.AppendDoubleElement(nil, "num", 0)) +
+			len(bsoncore.AppendBooleanElement(nil, "fromUpdates", true)) +
+			1
+
 		if useCustomID {
-			doc["_id"] = rand.Float64()
+			docSize += len(bsoncore.AppendDoubleElement(nil, "_id", 0))
 		}
-		newDocs[i] = doc
+
+		if totalSize+docSize > maxSubmissionSize {
+			break
+		}
+
+		doc := make(bson.Raw, 4, docSize)
+		binary.LittleEndian.PutUint32(doc, uint32(docSize))
+		if useCustomID {
+			doc = bsoncore.AppendDoubleElement(doc, "_id", rand.Float64())
+		}
+
+		doc = bsoncore.AppendDoubleElement(doc, "rand", rand.Float64())
+		doc = bsoncore.AppendStringElement(doc, "str", curStr)
+		doc = bsoncore.AppendDoubleElement(doc, "num", rand.Float64())
+		doc = bsoncore.AppendBooleanElement(doc, "fromUpdates", true)
+
+		doc = append(doc, 0) // trailing NUL
+
+		newDocs = append(newDocs, doc)
 	}
 
 	coll = coll.Database().Collection(
 		coll.Name(),
-		options.Collection().SetWriteConcern(writeconcern.Unacknowledged()),
+		options.Collection().SetWriteConcern(writeconcern.W1()),
 	)
 
 	res, err := coll.InsertMany(
